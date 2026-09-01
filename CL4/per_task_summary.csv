@@ -1,0 +1,5 @@
+task_id,task_description,task_name,successes,trials,success_rate
+6,put the cream cheese in the bowl,put_the_cream_cheese_in_the_bowl,34,50,0.68
+7,turn on the stove,turn_on_the_stove,50,50,1.0
+8,put the bowl on the plate,put_the_bowl_on_the_plate,42,50,0.84
+9,put the wine bottle on the rack,put_the_wine_bottle_on_the_rack,41,50,0.82

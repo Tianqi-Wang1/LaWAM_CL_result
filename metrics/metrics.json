@@ -1,0 +1,20 @@
+{
+  "protocol": "routing_v2_cl_only",
+  "metric_note": "FWT follows the existing acquisition/diagonal convention; standard unseen-task pre-learning FWT is not measured.",
+  "metrics_percent": {
+    "FWT": 90.5,
+    "FWT_acquisition_diagonal": 90.5,
+    "BWT_final": -9.33333333333333,
+    "BWT_lifecycle_mean": -9.999999999999998,
+    "Final_forgetting_pp": 9.33333333333333,
+    "NBT_REGEN": 10.006047611193576,
+    "AUC_CL_lifecycle": 86.125,
+    "final_seen_SR": 83.5
+  },
+  "stage_seen_average_percent": {
+    "CL1": 86.0,
+    "CL2": 86.0,
+    "CL3": 87.33333333333334,
+    "CL4": 83.5
+  }
+}

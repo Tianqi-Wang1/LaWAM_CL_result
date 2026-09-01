@@ -1,0 +1,13 @@
+Routing-V2 formal CLOSED-LOOP CL-only evaluation.
+No task ID is used by selection. Each task is evaluated in a separate process only so GT can be logged diagnostically.
+CL1 bank: T6; eval T6.
+CL2 bank: T6,T7; eval T6,T7.
+CL3 bank: T6,T7,T8; eval T6,T7,T8.
+CL4 bank: T6,T7,T8,T9; eval T6,T7,T8,T9.
+Per action chunk:
+  Base Semantic AE retrieval -> C_sem=(e2-e1)/(e2+eps).
+  Gate if C_sem < 0.20.
+  If gated, Top-2 candidate WAM imagination + Dynamics AE and adaptive pair-normalized fusion.
+  lambda_max=0.50, gamma=2.0.
+The selected Skill Path generates the real action chunk.
+NUM_TRIALS=50
