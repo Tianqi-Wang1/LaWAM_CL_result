@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-09-01T13:20:08",
+  "task_suite_name": "libero_goal",
+  "benchmark_variant": "libero",
+  "checkpoint_path": "/home/jincai_guo/tianqi/CVPR2027/checkpoints/lawam_cl/libero_goal/routing_v2/task6/skill_runs/20260901_000228+t6_routing_v2_b2_skill_qwm_lora32_2000step_4gpu_bs64_ga1/final_model/pytorch_model.pt",
+  "total_episodes": 50,
+  "total_successes": 36,
+  "total_success_rate": 0.72,
+  "num_trials_per_task": 50,
+  "seed": 0,
+  "max_tasks": null,
+  "task_ids": [
+    6
+  ],
+  "category_summary_path": null
+}

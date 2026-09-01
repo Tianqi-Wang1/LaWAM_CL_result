@@ -1,0 +1,3 @@
+scope,decisions,semantic_top1_accuracy,routing_accuracy,gate_activation_rate,mean_lambda_dyn
+ALL,814,1.0,1.0,0.0,0.0
+T6,814,1.0,1.0,0.0,0.0

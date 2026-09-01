@@ -1,0 +1,33 @@
+{
+  "decisions": 1518,
+  "summary": [
+    {
+      "scope": "ALL",
+      "decisions": 1518,
+      "semantic_top1_accuracy": 0.9769433465085638,
+      "routing_accuracy": 0.9749670619235836,
+      "gate_activation_rate": 0.11462450592885376,
+      "mean_lambda_dyn": 0.017399844103190534
+    },
+    {
+      "scope": "T6",
+      "decisions": 1041,
+      "semantic_top1_accuracy": 0.9663784822286263,
+      "routing_accuracy": 0.9634966378482228,
+      "gate_activation_rate": 0.1642651296829971,
+      "mean_lambda_dyn": 0.025371347191998756
+    },
+    {
+      "scope": "T7",
+      "decisions": 477,
+      "semantic_top1_accuracy": 1.0,
+      "routing_accuracy": 1.0,
+      "gate_activation_rate": 0.006289308176100629,
+      "mean_lambda_dyn": 2.915978558737705e-06
+    }
+  ],
+  "candidate_tasks": [
+    6,
+    7
+  ]
+}

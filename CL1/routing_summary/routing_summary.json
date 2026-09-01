@@ -1,0 +1,24 @@
+{
+  "decisions": 814,
+  "summary": [
+    {
+      "scope": "ALL",
+      "decisions": 814,
+      "semantic_top1_accuracy": 1.0,
+      "routing_accuracy": 1.0,
+      "gate_activation_rate": 0.0,
+      "mean_lambda_dyn": 0.0
+    },
+    {
+      "scope": "T6",
+      "decisions": 814,
+      "semantic_top1_accuracy": 1.0,
+      "routing_accuracy": 1.0,
+      "gate_activation_rate": 0.0,
+      "mean_lambda_dyn": 0.0
+    }
+  ],
+  "candidate_tasks": [
+    6
+  ]
+}

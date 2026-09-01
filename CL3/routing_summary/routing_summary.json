@@ -1,0 +1,42 @@
+{
+  "decisions": 2190,
+  "summary": [
+    {
+      "scope": "ALL",
+      "decisions": 2190,
+      "semantic_top1_accuracy": 0.8849315068493151,
+      "routing_accuracy": 0.891324200913242,
+      "gate_activation_rate": 0.46621004566210045,
+      "mean_lambda_dyn": 0.0794322309565301
+    },
+    {
+      "scope": "T6",
+      "decisions": 1106,
+      "semantic_top1_accuracy": 0.7902350813743219,
+      "routing_accuracy": 0.8146473779385172,
+      "gate_activation_rate": 0.6491862567811935,
+      "mean_lambda_dyn": 0.1188366777119784
+    },
+    {
+      "scope": "T7",
+      "decisions": 473,
+      "semantic_top1_accuracy": 1.0,
+      "routing_accuracy": 1.0,
+      "gate_activation_rate": 0.006342494714587738,
+      "mean_lambda_dyn": 2.9698615716785464e-06
+    },
+    {
+      "scope": "T8",
+      "decisions": 611,
+      "semantic_top1_accuracy": 0.967266775777414,
+      "routing_accuracy": 0.9459901800327333,
+      "gate_activation_rate": 0.4909983633387889,
+      "mean_lambda_dyn": 0.06959380605700403
+    }
+  ],
+  "candidate_tasks": [
+    6,
+    7,
+    8
+  ]
+}
