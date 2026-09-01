@@ -1,0 +1,216 @@
+run_id: libero_4in1_pretrain
+run_root_dir: results/Checkpoints/libero
+seed: 2026
+trackers:
+- wandb
+wandb_entity: null
+wandb_project: finetune-LIBERO
+is_debug: false
+framework:
+  name: LaWAM
+  qwenvl:
+    base_vlm: results/Checkpoints/qwen3_weights
+  action_model:
+    future_action_window_size: 49
+    past_action_window_size: 0
+    action_horizon: 50
+    lam_ckpt_path: latent_action_model/logs/dino_large_vae/lam_release/checkpoints/pytorch_model.pt
+    lam_yaml_path: latent_action_model/logs/dino_large_vae/lam_release/dino_large_vae.yaml
+    num_action_queries: 8
+    flow_action_num_queries: 8
+    perceptual_weight: 0.1
+    latent_action_placeholder_token: <ACT_PH>
+    flow_only_mode: false
+    enable_flow_h_t1_scheduled_sampling: false
+    flow_h_t1_pred_prob_start: 0.0
+    flow_h_t1_pred_prob_end: 1.0
+    flow_h_t1_pred_ramp_steps: 10000
+    detach_future_feature: true
+    future_prediction: true
+    enable_loss_distill: true
+    lam_encoder_distill_weight: 0.1
+    # Routing-V1 auxiliary expert-latent supervision (disabled by default).
+    enable_expert_latent_aux: false
+    expert_latent_distill_weight: 0.1
+    expert_world_loss_weight: 0.1
+    expert_latent_loss_type: mse
+
+    # Routing-V2: task-specific query residuals plus two post-hoc routing
+    # memories. Normal task-ID policy training/evaluation keeps memory disabled.
+    routing_v2_enable_query_delta: false
+    routing_v2_enable_memory: false
+    routing_v2_memory_train_mode: false
+    routing_v2_semantic_bottleneck: 128
+    routing_v2_dynamics_hidden: 192
+    routing_v2_dynamics_layers: 2
+    routing_v2_dynamics_heads: 6
+    routing_v2_dynamics_ffn: 768
+    routing_v2_dynamics_z_weight: 0.5
+    routing_v2_dynamics_pred_weight: 0.5
+    routing_v2_semantic_loss_weight: 1.0
+    routing_v2_dynamics_loss_weight: 1.0
+
+    repeated_diffusion_steps: 2
+    flow_cfg:
+      action_dim: 32
+      state_dim: 32
+      use_state: false
+      vlm_dim: 2048
+      hidden_dim: 1024
+      attention_heads: 16
+      num_layers: 16
+      num_target_vision_tokens: -1
+      interleave_self_attention: true
+      use_alternate_vldit: true
+      attend_text_every_n_blocks: 2
+      cfg_drop_prob: 0.0
+      cfg_guidance_scale: 1.0
+      num_inference_steps: 10
+      num_timestep_buckets: 1000
+      horizon_sec: 0.4
+      noise_beta_alpha: 1.5
+      noise_beta_beta: 1.0
+      noise_s: 0.999
+      token_independent_noise: false
+      use_action_positional_embeddings: true
+      residual_expert_num_blocks: 0
+      residual_expert_layer_indices: null
+      residual_expert_zero_init: true
+      residual_expert_scale: 1.0
+      # CLARE-style nonlinear conditioning adapters (disabled by default).
+      conditioning_adapter_bottleneck: 0
+      conditioning_adapter_target_enc_vlm: true
+      conditioning_adapter_target_adanorm: true
+      conditioning_adapter_zero_init: true
+      # Activation-space nonlinear side adapters for selected DiT blocks.
+      dit_nonlinear_adapter_bottleneck: 0
+      dit_nonlinear_adapter_layer_indices: null
+      dit_nonlinear_adapter_target_attention: true
+      dit_nonlinear_adapter_target_ffn: true
+      dit_nonlinear_adapter_zero_init: true
+      # Routing-V1 z* head (disabled by default). Output dim is auto-aligned
+      # to the loaded LAM code dimension when enabled.
+      enable_expert_latent_head: false
+      expert_latent_dim: -1
+      expert_latent_head_hidden_dim: 1024
+      expert_latent_head_dropout: 0.0
+datasets:
+  vla_data:
+    data_root_dir: dataset
+    data_mix: libero
+    # CL support
+    cl_suite: null
+    cl_task_ids: null
+    task_indices: null
+    use_task_filtered_statistics: false
+    image_resolution: 256
+    per_device_batch_size: 32
+    val_tail_ratio: 0.01
+    train_split_all: true
+    video_backend: pyav
+    num_frames: 2
+    enable_primary_video_aug: false
+    enable_primary_random_resized_crop: false
+    sec_chunk: 0.4
+    enable_video_frame_cache: false
+trainer:
+  max_train_steps: 25000
+  num_warmup_steps: 1500
+  save_interval: 25000
+  eval_interval: 500
+  eval_batches: 20
+  learning_rate:
+    base: 0.0001
+    action_model:
+      lr: 0.0001
+      modules:
+      - policy_backend.flow
+    world_model:
+      lr: 0.0001
+      modules:
+      - policy_backend.lam.decoder
+    vlm:
+      lr: 0.0001
+      modules:
+      - policy_backend.vlm
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze:
+    freeze_vision_backbone: false
+    freeze_llm_backbone: false
+    keep_llm_first_n_layers: 16
+    freeze_last_llm_layer: true
+    freeze_embedding: true
+    unfreeze_vision_merger: true
+    unfreeze_llm_last_n_layers: -1
+
+    freeze_vlm_all: false
+    freeze_act_query: false
+    freeze_flow_action_query: false
+
+    train_flow_only: false
+    train_flow_lora: false
+    train_flow_residual_expert: false
+    train_flow_partial_dense: false
+    flow_partial_dense_layer_indices: null
+
+    # Optional Flow I/O interface adaptation paired with partial-dense DiT FT.
+    train_flow_interface_dense: false
+    train_flow_interface_lora: false
+    flow_interface_target_enc_vlm: true
+    flow_interface_target_action_encoder: true
+    flow_interface_target_action_decoder: true
+    flow_interface_target_state_encoder: true
+    flow_interface_target_output: true
+    flow_interface_target_timestep: true
+
+    # Joint VLM + Action-Flow LoRA ablation.
+    train_vlm_flow_lora: false
+    train_vlm_text_lora_partial_dense: false
+    train_vlm_text_lora_conditioning_adapter: false
+    train_flow_partial_dense_conditioning_adapter: false
+    train_vlm_text_lora_partial_dense_conditioning_adapter: false
+    # v8 nonlinear Action-side adapter modes.
+    train_flow_partial_dense_conditioning_nonlinear_adapter: false
+    train_vlm_text_lora_partial_dense_conditioning_nonlinear_adapter: false
+    train_flow_conditioning_nonlinear_adapter: false
+    train_expert_latent_head: false
+
+    # Routing-V2 standalone modes.
+    train_routing_v2_skill: false
+    train_routing_v2_memory_only: false
+    routing_v2_qformer_lora_rank: 32
+    routing_v2_qformer_lora_alpha: 32
+    routing_v2_qformer_lora_dropout: 0.0
+    routing_v2_lawm_lora_rank: 32
+    routing_v2_lawm_lora_alpha: 32
+    routing_v2_lawm_lora_dropout: 0.0
+
+    vlm_lora_target_text: false
+    vlm_lora_text_last_n: 0
+    vlm_lora_target_vision: false
+    vlm_lora_target_merger: false
+    vlm_lora_rank: 8
+    vlm_lora_alpha: 8.0
+    vlm_lora_dropout: 0.0
+
+    flow_lora_rank: 8
+    flow_lora_alpha: 8.0
+    flow_lora_dropout: 0.0
+
+    unfreeze_lam_decoder: true
+  logging_frequency: 100
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  ddp_find_unused_parameters: false
+  optimizer:
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+  pretrained_checkpoint: results/Checkpoints/pretrain/lawam_pretrain/final_model/pytorch_model.pt
+  load_pretrained_policy_flow: true
+  policy_flow_override_checkpoint: null
+  use_pretrained_dataset_statistics: false

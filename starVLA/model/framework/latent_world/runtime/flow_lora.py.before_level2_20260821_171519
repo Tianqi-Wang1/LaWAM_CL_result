@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FlowLoRALinear(nn.Linear):
+    """nn.Linear-compatible LoRA layer preserving original checkpoint keys."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        rank: int = 8,
+        alpha: float = 8.0,
+        dropout: float = 0.0,
+        device=None,
+        dtype=None,
+    ) -> None:
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be > 0, got {rank}")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError(f"LoRA dropout must be in [0,1), got {dropout}")
+
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.lora_rank = int(rank)
+        self.lora_alpha = float(alpha)
+        self.lora_scaling = float(alpha) / float(rank)
+        self.lora_dropout_p = float(dropout)
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        self.lora_A = nn.Parameter(
+            torch.empty(
+                self.lora_rank,
+                in_features,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+        )
+        self.lora_B = nn.Parameter(
+            torch.empty(
+                out_features,
+                self.lora_rank,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+        )
+        self.reset_lora_parameters()
+
+    def reset_lora_parameters(self) -> None:
+        # Function-preserving initialization: B @ A == 0 at initialization.
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> "FlowLoRALinear":
+        if isinstance(linear, FlowLoRALinear):
+            if (
+                linear.lora_rank != int(rank)
+                or float(linear.lora_alpha) != float(alpha)
+                or float(linear.lora_dropout_p) != float(dropout)
+            ):
+                raise RuntimeError(
+                    "FlowLoRALinear already exists with a different config: "
+                    f"rank={linear.lora_rank}, alpha={linear.lora_alpha}, "
+                    f"dropout={linear.lora_dropout_p}"
+                )
+            return linear
+
+        if not isinstance(linear, nn.Linear):
+            raise TypeError(f"Expected nn.Linear, got {type(linear).__name__}")
+
+        new = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+
+        # Preserve exact original Parameter objects and checkpoint key names.
+        new.weight = linear.weight
+        new.bias = linear.bias
+        new.weight.requires_grad_(False)
+        if new.bias is not None:
+            new.bias.requires_grad_(False)
+        return new
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        base = F.linear(input, self.weight, self.bias)
+        x = self.lora_dropout(input)
+        low_rank = F.linear(x, self.lora_A)
+        update = F.linear(low_rank, self.lora_B)
+        return base + update * self.lora_scaling
+
+
+@dataclass(frozen=True)
+class FlowLoRAInjectionSummary:
+    num_blocks: int
+    target_modules: tuple[str, ...]
+    trainable_tensors: int
+    trainable_params: int
+    rank: int
+    alpha: float
+    dropout: float
+    target_attention: bool
+    target_ffn: bool
+    target_enc_vlm: bool
+    target_enc_wm: bool
+    target_output: bool
+    transformer_targets: int
+    enc_vlm_targets: int
+    enc_wm_targets: int
+    output_targets: int
+
+
+def _replace_attr_linear(parent, attr: str, *, rank: int, alpha: float, dropout: float):
+    old = getattr(parent, attr)
+    new = FlowLoRALinear.from_linear(old, rank=rank, alpha=alpha, dropout=dropout)
+    setattr(parent, attr, new)
+    return new
+
+
+def _replace_index_linear(parent, index: int, *, rank: int, alpha: float, dropout: float):
+    old = parent[index]
+    new = FlowLoRALinear.from_linear(old, rank=rank, alpha=alpha, dropout=dropout)
+    parent[index] = new
+    return new
+
+
+def _replace_child_module(parent: nn.Module, name: str, module: nn.Module) -> None:
+    # Robust for Sequential / ModuleList / ModuleDict / normal nn.Module.
+    parent._modules[name] = module
+
+
+def _inject_all_linears_recursive(
+    module: nn.Module,
+    *,
+    prefix: str,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> List[str]:
+    """Replace every descendant nn.Linear under `module` with FlowLoRALinear."""
+    targets: List[str] = []
+
+    for child_name, child in list(module.named_children()):
+        child_path = f"{prefix}.{child_name}" if prefix else child_name
+        if isinstance(child, nn.Linear):
+            new = FlowLoRALinear.from_linear(
+                child,
+                rank=rank,
+                alpha=alpha,
+                dropout=dropout,
+            )
+            _replace_child_module(module, child_name, new)
+            targets.append(child_path)
+        else:
+            targets.extend(
+                _inject_all_linears_recursive(
+                    child,
+                    prefix=child_path,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                )
+            )
+    return targets
+
+
+def _inject_subtree_linears(
+    flow: nn.Module,
+    attr: str,
+    *,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> List[str]:
+    subtree = getattr(flow, attr, None)
+    if subtree is None:
+        raise RuntimeError(
+            f"Requested Flow-LoRA target `{attr}`, but policy_backend.flow.{attr} "
+            "does not exist."
+        )
+
+    if isinstance(subtree, nn.Linear):
+        _replace_attr_linear(flow, attr, rank=rank, alpha=alpha, dropout=dropout)
+        return [attr]
+
+    targets = _inject_all_linears_recursive(
+        subtree,
+        prefix=attr,
+        rank=rank,
+        alpha=alpha,
+        dropout=dropout,
+    )
+    if not targets:
+        raise RuntimeError(
+            f"Requested Flow-LoRA target `{attr}`, but no nn.Linear was found "
+            f"under policy_backend.flow.{attr}."
+        )
+    return targets
+
+
+def inject_flow_lora(
+    flow: nn.Module,
+    *,
+    rank: int = 8,
+    alpha: float = 8.0,
+    dropout: float = 0.0,
+    target_attention: bool = True,
+    target_ffn: bool = True,
+    target_enc_vlm: bool = False,
+    target_enc_wm: bool = False,
+    target_output: bool = False,
+) -> FlowLoRAInjectionSummary:
+    """Inject LoRA into selected parts of the frozen LaWAM Flow expert.
+
+    Transformer targets per block:
+      Attention: attn1.to_q / to_k / to_v / to_out.0
+      FFN:       ff.net.0.proj / ff.net.2
+
+    Optional interface/output targets:
+      enc_vlm: all descendant nn.Linear under policy_backend.flow.enc_vlm
+      enc_wm : all descendant nn.Linear under policy_backend.flow.enc_wm
+      output : policy_backend.flow.DiT.proj_out_1 / proj_out_2
+    """
+    if not any(
+        (
+            target_attention,
+            target_ffn,
+            target_enc_vlm,
+            target_enc_wm,
+            target_output,
+        )
+    ):
+        raise ValueError("At least one Flow-LoRA target group must be enabled.")
+
+    dit = getattr(flow, "DiT", None)
+    if dit is None:
+        raise RuntimeError("policy_backend.flow.DiT does not exist.")
+
+    blocks = getattr(dit, "transformer_blocks", None)
+    if blocks is None:
+        raise RuntimeError("policy_backend.flow.DiT.transformer_blocks does not exist.")
+
+    target_names: List[str] = []
+    transformer_names: List[str] = []
+
+    for idx, block in enumerate(blocks):
+        if target_attention:
+            attn = getattr(block, "attn1", None)
+            if attn is None:
+                raise RuntimeError(f"Flow block {idx} has no attn1 module.")
+
+            _replace_attr_linear(attn, "to_q", rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.attn1.to_q")
+
+            _replace_attr_linear(attn, "to_k", rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.attn1.to_k")
+
+            _replace_attr_linear(attn, "to_v", rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.attn1.to_v")
+
+            to_out = getattr(attn, "to_out", None)
+            if to_out is None or len(to_out) < 1:
+                raise RuntimeError(f"Flow block {idx} has invalid attn1.to_out.")
+            _replace_index_linear(to_out, 0, rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.attn1.to_out.0")
+
+        if target_ffn:
+            ff = getattr(block, "ff", None)
+            if ff is None:
+                raise RuntimeError(f"Flow block {idx} has no ff module.")
+            net = getattr(ff, "net", None)
+            if net is None or len(net) < 3:
+                raise RuntimeError(f"Flow block {idx} has invalid ff.net.")
+
+            first = net[0]
+            if not hasattr(first, "proj"):
+                raise RuntimeError(f"Flow block {idx} ff.net[0] has no proj Linear.")
+            _replace_attr_linear(first, "proj", rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.ff.net.0.proj")
+
+            _replace_index_linear(net, 2, rank=rank, alpha=alpha, dropout=dropout)
+            transformer_names.append(f"DiT.transformer_blocks.{idx}.ff.net.2")
+
+    target_names.extend(transformer_names)
+
+    enc_vlm_names: List[str] = []
+    if target_enc_vlm:
+        enc_vlm_names = _inject_subtree_linears(
+            flow,
+            "enc_vlm",
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        target_names.extend(enc_vlm_names)
+
+    enc_wm_names: List[str] = []
+    if target_enc_wm:
+        enc_wm_names = _inject_subtree_linears(
+            flow,
+            "enc_wm",
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        target_names.extend(enc_wm_names)
+
+    output_names: List[str] = []
+    if target_output:
+        for attr in ("proj_out_1", "proj_out_2"):
+            if not hasattr(dit, attr):
+                raise RuntimeError(
+                    f"Requested output LoRA, but policy_backend.flow.DiT.{attr} "
+                    "does not exist."
+                )
+            _replace_attr_linear(dit, attr, rank=rank, alpha=alpha, dropout=dropout)
+            output_names.append(f"DiT.{attr}")
+        target_names.extend(output_names)
+
+    if len(target_names) != len(set(target_names)):
+        raise RuntimeError("Duplicate Flow-LoRA target module names detected.")
+
+    target_set = set(target_names)
+    for name, module in flow.named_modules():
+        if name in target_set and not isinstance(module, FlowLoRALinear):
+            raise RuntimeError(f"Target {name} was not converted to FlowLoRALinear.")
+
+    lora_params = [
+        (name, param)
+        for name, param in flow.named_parameters()
+        if name.endswith(".lora_A") or name.endswith(".lora_B")
+    ]
+
+    if len(lora_params) != 2 * len(target_names):
+        raise RuntimeError(
+            "Flow-LoRA parameter tensor count mismatch: "
+            f"got={len(lora_params)}, expected={2 * len(target_names)}"
+        )
+
+    trainable_params = sum(p.numel() for _, p in lora_params)
+
+    return FlowLoRAInjectionSummary(
+        num_blocks=len(blocks),
+        target_modules=tuple(target_names),
+        trainable_tensors=len(lora_params),
+        trainable_params=trainable_params,
+        rank=int(rank),
+        alpha=float(alpha),
+        dropout=float(dropout),
+        target_attention=bool(target_attention),
+        target_ffn=bool(target_ffn),
+        target_enc_vlm=bool(target_enc_vlm),
+        target_enc_wm=bool(target_enc_wm),
+        target_output=bool(target_output),
+        transformer_targets=len(transformer_names),
+        enc_vlm_targets=len(enc_vlm_names),
+        enc_wm_targets=len(enc_wm_names),
+        output_targets=len(output_names),
+    )

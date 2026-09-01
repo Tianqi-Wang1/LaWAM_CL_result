@@ -1,0 +1,555 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# =============================================================================
+# Standard LoRA for ordinary nn.Linear
+# =============================================================================
+
+class FlowLoRALinear(nn.Linear):
+    """Frozen Base Linear + trainable low-rank task residual."""
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        rank: int = 8,
+        alpha: float = 8.0,
+        dropout: float = 0.0,
+        device=None,
+        dtype=None,
+    ) -> None:
+        if rank <= 0:
+            raise ValueError(f"LoRA rank must be > 0, got {rank}")
+        if not (0.0 <= dropout < 1.0):
+            raise ValueError(f"LoRA dropout must be in [0,1), got {dropout}")
+
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.lora_rank = int(rank)
+        self.lora_alpha = float(alpha)
+        self.lora_scaling = float(alpha) / float(rank)
+        self.lora_dropout_p = float(dropout)
+        self.lora_dropout = (
+            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+        )
+
+        # PyTorch Linear weight is [out, in].
+        self.lora_A = nn.Parameter(
+            torch.empty(
+                self.lora_rank,
+                in_features,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+        )
+        self.lora_B = nn.Parameter(
+            torch.empty(
+                out_features,
+                self.lora_rank,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+        )
+        self.reset_adapter_parameters()
+
+    def reset_adapter_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.lora_A, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_B)
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+        *,
+        rank: int,
+        alpha: float,
+        dropout: float,
+    ) -> "FlowLoRALinear":
+        if isinstance(linear, FlowLoRALinear):
+            return linear
+        if not isinstance(linear, nn.Linear):
+            raise TypeError(
+                f"Expected nn.Linear, got {type(linear).__name__}"
+            )
+
+        new = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+
+        # Keep exact original Base Parameter objects / names.
+        new.weight = linear.weight
+        new.bias = linear.bias
+        new.weight.requires_grad_(False)
+        if new.bias is not None:
+            new.bias.requires_grad_(False)
+
+        return new
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.weight, self.bias)
+        z = self.lora_dropout(x)
+        z = F.linear(z, self.lora_A)
+        z = F.linear(z, self.lora_B)
+        return base + self.lora_scaling * z
+
+
+# =============================================================================
+# Dense zero-init residual for small critical ordinary Linear interfaces
+# =============================================================================
+
+class FlowDenseDeltaLinear(nn.Linear):
+    """
+    Frozen Base Linear + trainable full-rank task-specific delta_weight.
+
+    W_task = W_base + DeltaW_task
+    DeltaW_task is zero initialized.
+
+    Bias is intentionally kept frozen for a clean minimal experiment.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__(
+            in_features,
+            out_features,
+            bias=bias,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.delta_weight = nn.Parameter(
+            torch.zeros(
+                out_features,
+                in_features,
+                device=self.weight.device,
+                dtype=self.weight.dtype,
+            )
+        )
+
+    @classmethod
+    def from_linear(
+        cls,
+        linear: nn.Linear,
+    ) -> "FlowDenseDeltaLinear":
+        if isinstance(linear, FlowDenseDeltaLinear):
+            return linear
+        if not isinstance(linear, nn.Linear):
+            raise TypeError(
+                f"Expected nn.Linear, got {type(linear).__name__}"
+            )
+
+        new = cls(
+            linear.in_features,
+            linear.out_features,
+            bias=linear.bias is not None,
+            device=linear.weight.device,
+            dtype=linear.weight.dtype,
+        )
+
+        new.weight = linear.weight
+        new.bias = linear.bias
+        new.weight.requires_grad_(False)
+        if new.bias is not None:
+            new.bias.requires_grad_(False)
+
+        return new
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.weight, self.bias)
+        delta = F.linear(x, self.delta_weight, None)
+        return base + delta
+
+
+# =============================================================================
+# Injection
+# =============================================================================
+
+@dataclass(frozen=True)
+class FlowAdapterSummary:
+    num_blocks: int
+    target_modules: tuple[str, ...]
+    trainable_tensors: int
+    trainable_params: int
+
+    transformer_rank: int
+    transformer_alpha: float
+    interface_mode: str
+
+    attention_targets: int
+    ffn_targets: int
+    enc_vlm_targets: int
+    output_targets: int
+
+    lora_modules: int
+    dense_delta_modules: int
+    lora_params: int
+    dense_delta_params: int
+
+
+def _replace_attr_lora(
+    parent: nn.Module,
+    attr: str,
+    *,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> None:
+    old = getattr(parent, attr)
+    setattr(
+        parent,
+        attr,
+        FlowLoRALinear.from_linear(
+            old,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        ),
+    )
+
+
+def _replace_index_lora(
+    parent,
+    idx: int,
+    *,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> None:
+    old = parent[idx]
+    parent[idx] = FlowLoRALinear.from_linear(
+        old,
+        rank=rank,
+        alpha=alpha,
+        dropout=dropout,
+    )
+
+
+def _inject_all_linear_interfaces(
+    module: nn.Module,
+    *,
+    prefix: str,
+    mode: str,
+    rank: int,
+    alpha: float,
+    dropout: float,
+) -> List[str]:
+    names: List[str] = []
+
+    for child_name, child in list(module.named_children()):
+        path = f"{prefix}.{child_name}" if prefix else child_name
+
+        if isinstance(child, nn.Linear):
+            if mode == "lora":
+                module._modules[child_name] = FlowLoRALinear.from_linear(
+                    child,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                )
+            elif mode == "dense":
+                module._modules[child_name] = (
+                    FlowDenseDeltaLinear.from_linear(child)
+                )
+            else:
+                raise ValueError(f"Unknown interface_mode={mode}")
+            names.append(path)
+        else:
+            names.extend(
+                _inject_all_linear_interfaces(
+                    child,
+                    prefix=path,
+                    mode=mode,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                )
+            )
+
+    return names
+
+
+def inject_flow_task_adapter(
+    flow: nn.Module,
+    *,
+    transformer_rank: int = 8,
+    transformer_alpha: float = 8.0,
+    dropout: float = 0.0,
+    interface_mode: str = "lora",
+) -> FlowAdapterSummary:
+    """
+    Two supported T9 experiments:
+
+    interface_mode="lora":
+        Broad Level-2 LoRA:
+          Transformer Q/K/V/O + FFN
+          enc_vlm
+          DiT.proj_out_1 / proj_out_2
+        all use the same rank/alpha.
+
+    interface_mode="dense":
+        Mixed PEFT:
+          Transformer Q/K/V/O + FFN -> LoRA
+          enc_vlm + proj_out_1/2     -> zero-init full-rank delta
+
+    Always frozen:
+      action_encoder/action_decoder
+      timestep encoder
+      norms/biases
+      VLM/QFormer/LaWM
+      every original Base parameter.
+    """
+    if interface_mode not in ("lora", "dense"):
+        raise ValueError(
+            f"interface_mode must be `lora` or `dense`, got {interface_mode}"
+        )
+
+    dit = getattr(flow, "DiT", None)
+    if dit is None:
+        raise RuntimeError("policy_backend.flow.DiT does not exist.")
+
+    blocks = getattr(dit, "transformer_blocks", None)
+    if blocks is None:
+        raise RuntimeError(
+            "policy_backend.flow.DiT.transformer_blocks does not exist."
+        )
+
+    attention_names: List[str] = []
+    ffn_names: List[str] = []
+    enc_vlm_names: List[str] = []
+    output_names: List[str] = []
+
+    # -------------------------------------------------------------------------
+    # Transformer always LoRA.
+    # -------------------------------------------------------------------------
+    for idx, block in enumerate(blocks):
+        attn = getattr(block, "attn1", None)
+        if attn is None:
+            raise RuntimeError(f"Flow block {idx} has no attn1.")
+
+        for attr in ("to_q", "to_k", "to_v"):
+            _replace_attr_lora(
+                attn,
+                attr,
+                rank=transformer_rank,
+                alpha=transformer_alpha,
+                dropout=dropout,
+            )
+            attention_names.append(
+                f"DiT.transformer_blocks.{idx}.attn1.{attr}"
+            )
+
+        to_out = getattr(attn, "to_out", None)
+        if to_out is None or len(to_out) < 1:
+            raise RuntimeError(
+                f"Flow block {idx} has invalid attn1.to_out."
+            )
+
+        _replace_index_lora(
+            to_out,
+            0,
+            rank=transformer_rank,
+            alpha=transformer_alpha,
+            dropout=dropout,
+        )
+        attention_names.append(
+            f"DiT.transformer_blocks.{idx}.attn1.to_out.0"
+        )
+
+        ff = getattr(block, "ff", None)
+        if ff is None:
+            raise RuntimeError(f"Flow block {idx} has no ff.")
+
+        net = getattr(ff, "net", None)
+        if net is None or len(net) < 3:
+            raise RuntimeError(f"Flow block {idx} has invalid ff.net.")
+
+        first = net[0]
+        if not hasattr(first, "proj"):
+            raise RuntimeError(
+                f"Flow block {idx} ff.net[0] has no proj."
+            )
+
+        _replace_attr_lora(
+            first,
+            "proj",
+            rank=transformer_rank,
+            alpha=transformer_alpha,
+            dropout=dropout,
+        )
+        ffn_names.append(
+            f"DiT.transformer_blocks.{idx}.ff.net.0.proj"
+        )
+
+        _replace_index_lora(
+            net,
+            2,
+            rank=transformer_rank,
+            alpha=transformer_alpha,
+            dropout=dropout,
+        )
+        ffn_names.append(
+            f"DiT.transformer_blocks.{idx}.ff.net.2"
+        )
+
+    # -------------------------------------------------------------------------
+    # enc_vlm interface.
+    # -------------------------------------------------------------------------
+    enc_vlm = getattr(flow, "enc_vlm", None)
+    if enc_vlm is None:
+        raise RuntimeError("flow.enc_vlm does not exist.")
+
+    if isinstance(enc_vlm, nn.Linear):
+        if interface_mode == "lora":
+            flow.enc_vlm = FlowLoRALinear.from_linear(
+                enc_vlm,
+                rank=transformer_rank,
+                alpha=transformer_alpha,
+                dropout=dropout,
+            )
+        else:
+            flow.enc_vlm = FlowDenseDeltaLinear.from_linear(enc_vlm)
+        enc_vlm_names = ["enc_vlm"]
+    else:
+        enc_vlm_names = _inject_all_linear_interfaces(
+            enc_vlm,
+            prefix="enc_vlm",
+            mode=interface_mode,
+            rank=transformer_rank,
+            alpha=transformer_alpha,
+            dropout=dropout,
+        )
+
+    if len(enc_vlm_names) != 1:
+        raise RuntimeError(
+            f"Expected exactly 1 enc_vlm Linear, got {len(enc_vlm_names)}"
+        )
+
+    # -------------------------------------------------------------------------
+    # DiT output interface.
+    # -------------------------------------------------------------------------
+    for attr in ("proj_out_1", "proj_out_2"):
+        if not hasattr(dit, attr):
+            raise RuntimeError(f"flow.DiT.{attr} does not exist.")
+
+        old = getattr(dit, attr)
+        if interface_mode == "lora":
+            setattr(
+                dit,
+                attr,
+                FlowLoRALinear.from_linear(
+                    old,
+                    rank=transformer_rank,
+                    alpha=transformer_alpha,
+                    dropout=dropout,
+                ),
+            )
+        else:
+            setattr(
+                dit,
+                attr,
+                FlowDenseDeltaLinear.from_linear(old),
+            )
+        output_names.append(f"DiT.{attr}")
+
+    targets = (
+        attention_names
+        + ffn_names
+        + enc_vlm_names
+        + output_names
+    )
+
+    if len(attention_names) != 64:
+        raise RuntimeError(
+            f"Expected 64 attention targets, got {len(attention_names)}"
+        )
+    if len(ffn_names) != 32:
+        raise RuntimeError(
+            f"Expected 32 FFN targets, got {len(ffn_names)}"
+        )
+    if len(output_names) != 2:
+        raise RuntimeError(
+            f"Expected 2 output targets, got {len(output_names)}"
+        )
+    if len(targets) != 99:
+        raise RuntimeError(
+            f"Expected 99 total Level-2 target modules, got {len(targets)}"
+        )
+
+    lora_params = [
+        p
+        for name, p in flow.named_parameters()
+        if name.endswith(".lora_A") or name.endswith(".lora_B")
+    ]
+    dense_params = [
+        p
+        for name, p in flow.named_parameters()
+        if name.endswith(".delta_weight")
+    ]
+
+    lora_modules = len(lora_params) // 2
+    dense_modules = len(dense_params)
+
+    expected_lora_modules = 99 if interface_mode == "lora" else 96
+    expected_dense_modules = 0 if interface_mode == "lora" else 3
+
+    if lora_modules != expected_lora_modules:
+        raise RuntimeError(
+            f"LoRA module count mismatch: "
+            f"expected={expected_lora_modules}, got={lora_modules}"
+        )
+    if dense_modules != expected_dense_modules:
+        raise RuntimeError(
+            f"Dense-delta module count mismatch: "
+            f"expected={expected_dense_modules}, got={dense_modules}"
+        )
+
+    trainable_tensors = len(lora_params) + len(dense_params)
+    lora_numel = sum(p.numel() for p in lora_params)
+    dense_numel = sum(p.numel() for p in dense_params)
+
+    return FlowAdapterSummary(
+        num_blocks=len(blocks),
+        target_modules=tuple(targets),
+        trainable_tensors=trainable_tensors,
+        trainable_params=lora_numel + dense_numel,
+        transformer_rank=int(transformer_rank),
+        transformer_alpha=float(transformer_alpha),
+        interface_mode=interface_mode,
+        attention_targets=len(attention_names),
+        ffn_targets=len(ffn_names),
+        enc_vlm_targets=len(enc_vlm_names),
+        output_targets=len(output_names),
+        lora_modules=lora_modules,
+        dense_delta_modules=dense_modules,
+        lora_params=lora_numel,
+        dense_delta_params=dense_numel,
+    )

@@ -1,0 +1,387 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from starVLA.model.framework.vlas.vlm_auto import (
+    _keep_first_n_llm_layers,
+    _resolve_llm_module,
+    _unfreeze_last_n_llm_layers,
+    freeze_qwen3vl,
+)
+from starVLA.model.framework.latent_world.runtime.flow_lora import (
+    inject_flow_lora,
+)
+
+
+@dataclass(frozen=True)
+class LatentWorldPolicyFreezeConfig:
+    freeze_vision_backbone: bool = False
+    freeze_llm_backbone: bool = False
+    freeze_last_llm_layer: bool = False
+    freeze_embedding: bool = False
+    unfreeze_vision_merger: bool = False
+
+    freeze_vlm_all: bool = False
+    freeze_act_query: bool = False
+    freeze_flow_action_query: bool = False
+
+    train_flow_only: bool = False
+
+    train_flow_lora: bool = False
+    flow_lora_rank: int = 8
+    flow_lora_alpha: float = 8.0
+    flow_lora_dropout: float = 0.0
+
+    flow_lora_target_attention: bool = True
+    flow_lora_target_ffn: bool = True
+
+    # Level-2.
+    flow_lora_target_enc_vlm: bool = False
+    flow_lora_target_output: bool = False
+
+    # Level-3.
+    flow_lora_target_action_encoder: bool = False
+    flow_lora_target_action_decoder: bool = False
+
+    unfreeze_lam_decoder: bool = False
+    keep_llm_first_n_layers: Optional[int] = None
+    unfreeze_llm_last_n_layers: Optional[int] = None
+
+
+def parse_policy_freeze_config(
+    freeze_cfg: Any,
+) -> LatentWorldPolicyFreezeConfig:
+    if freeze_cfg is None:
+        return LatentWorldPolicyFreezeConfig()
+
+    unfreeze_last_n = freeze_cfg.get(
+        "unfreeze_llm_last_n_layers", None
+    )
+    if unfreeze_last_n is not None:
+        unfreeze_last_n = int(unfreeze_last_n)
+
+    keep_first_n = freeze_cfg.get(
+        "keep_llm_first_n_layers", None
+    )
+    if keep_first_n is not None:
+        keep_first_n = int(keep_first_n)
+        if keep_first_n <= 0:
+            keep_first_n = None
+
+    return LatentWorldPolicyFreezeConfig(
+        freeze_vision_backbone=bool(
+            freeze_cfg.get("freeze_vision_backbone", False)
+        ),
+        freeze_llm_backbone=bool(
+            freeze_cfg.get("freeze_llm_backbone", False)
+        ),
+        freeze_last_llm_layer=bool(
+            freeze_cfg.get("freeze_last_llm_layer", False)
+        ),
+        freeze_embedding=bool(
+            freeze_cfg.get("freeze_embedding", False)
+        ),
+        unfreeze_vision_merger=bool(
+            freeze_cfg.get("unfreeze_vision_merger", False)
+        ),
+        freeze_vlm_all=bool(
+            freeze_cfg.get("freeze_vlm_all", False)
+        ),
+        freeze_act_query=bool(
+            freeze_cfg.get("freeze_act_query", False)
+        ),
+        freeze_flow_action_query=bool(
+            freeze_cfg.get("freeze_flow_action_query", False)
+        ),
+        train_flow_only=bool(
+            freeze_cfg.get("train_flow_only", False)
+        ),
+        train_flow_lora=bool(
+            freeze_cfg.get("train_flow_lora", False)
+        ),
+        flow_lora_rank=int(
+            freeze_cfg.get("flow_lora_rank", 8)
+        ),
+        flow_lora_alpha=float(
+            freeze_cfg.get("flow_lora_alpha", 8.0)
+        ),
+        flow_lora_dropout=float(
+            freeze_cfg.get("flow_lora_dropout", 0.0)
+        ),
+        flow_lora_target_attention=bool(
+            freeze_cfg.get("flow_lora_target_attention", True)
+        ),
+        flow_lora_target_ffn=bool(
+            freeze_cfg.get("flow_lora_target_ffn", True)
+        ),
+        flow_lora_target_enc_vlm=bool(
+            freeze_cfg.get("flow_lora_target_enc_vlm", False)
+        ),
+        flow_lora_target_output=bool(
+            freeze_cfg.get("flow_lora_target_output", False)
+        ),
+        flow_lora_target_action_encoder=bool(
+            freeze_cfg.get(
+                "flow_lora_target_action_encoder",
+                False,
+            )
+        ),
+        flow_lora_target_action_decoder=bool(
+            freeze_cfg.get(
+                "flow_lora_target_action_decoder",
+                False,
+            )
+        ),
+        unfreeze_lam_decoder=bool(
+            freeze_cfg.get("unfreeze_lam_decoder", False)
+        ),
+        keep_llm_first_n_layers=keep_first_n,
+        unfreeze_llm_last_n_layers=unfreeze_last_n,
+    )
+
+
+def _apply_strict_vlm_interface_freeze(
+    policy_backend,
+    freeze_policy: LatentWorldPolicyFreezeConfig,
+) -> None:
+    if freeze_policy.freeze_vlm_all:
+        policy_backend.vlm.requires_grad_(False)
+
+    if freeze_policy.freeze_act_query:
+        act_query = getattr(policy_backend, "act_query", None)
+        if act_query is None:
+            raise RuntimeError(
+                "freeze_act_query=True but policy_backend.act_query "
+                "does not exist."
+            )
+        act_query.requires_grad_(False)
+
+    if freeze_policy.freeze_flow_action_query:
+        flow_action_query = getattr(
+            policy_backend,
+            "flow_action_query",
+            None,
+        )
+        if flow_action_query is None:
+            raise RuntimeError(
+                "freeze_flow_action_query=True but "
+                "policy_backend.flow_action_query does not exist."
+            )
+        flow_action_query.requires_grad_(False)
+
+
+def _apply_flow_only_training(policy_backend) -> None:
+    policy_backend.requires_grad_(False)
+
+    flow = getattr(policy_backend, "flow", None)
+    if flow is None:
+        raise RuntimeError(
+            "train_flow_only=True but policy_backend.flow does not exist."
+        )
+
+    flow.requires_grad_(True)
+
+    trainable = [
+        name
+        for name, p in policy_backend.named_parameters()
+        if p.requires_grad
+    ]
+
+    if not trainable:
+        raise RuntimeError(
+            "train_flow_only=True but no Flow params are trainable."
+        )
+
+    bad = [
+        name
+        for name in trainable
+        if not (name == "flow" or name.startswith("flow."))
+    ]
+    if bad:
+        raise RuntimeError(
+            "train_flow_only=True but non-Flow params are trainable: "
+            f"{bad[:50]}"
+        )
+
+    print(
+        "[freeze-policy] FLOW-ONLY training enabled: "
+        f"trainable_tensors={len(trainable)}, "
+        "all non-Flow policy parameters frozen."
+    )
+
+
+def _apply_flow_lora_training(
+    policy_backend,
+    freeze_policy: LatentWorldPolicyFreezeConfig,
+) -> None:
+    if freeze_policy.train_flow_only:
+        raise RuntimeError(
+            "train_flow_only and train_flow_lora are mutually exclusive."
+        )
+
+    # FINAL AUTHORITY: freeze every existing Base WAM + Base Flow parameter.
+    policy_backend.requires_grad_(False)
+
+    flow = getattr(policy_backend, "flow", None)
+    if flow is None:
+        raise RuntimeError(
+            "train_flow_lora=True but policy_backend.flow does not exist."
+        )
+
+    summary = inject_flow_lora(
+        flow,
+        rank=freeze_policy.flow_lora_rank,
+        alpha=freeze_policy.flow_lora_alpha,
+        dropout=freeze_policy.flow_lora_dropout,
+        target_attention=freeze_policy.flow_lora_target_attention,
+        target_ffn=freeze_policy.flow_lora_target_ffn,
+        target_enc_vlm=freeze_policy.flow_lora_target_enc_vlm,
+        target_output=freeze_policy.flow_lora_target_output,
+        target_action_encoder=freeze_policy.flow_lora_target_action_encoder,
+        target_action_decoder=freeze_policy.flow_lora_target_action_decoder,
+    )
+
+    # Re-open ONLY newly introduced LoRA tensors.
+    for name, p in flow.named_parameters():
+        p.requires_grad = bool(
+            name.endswith(".lora_A")
+            or name.endswith(".lora_B")
+        )
+
+    trainable = [
+        (name, p)
+        for name, p in policy_backend.named_parameters()
+        if p.requires_grad
+    ]
+
+    if not trainable:
+        raise RuntimeError(
+            "train_flow_lora=True but no LoRA params are trainable."
+        )
+
+    unexpected = [
+        name
+        for name, _ in trainable
+        if not (
+            name.startswith("flow.")
+            and (
+                name.endswith(".lora_A")
+                or name.endswith(".lora_B")
+            )
+        )
+    ]
+
+    if unexpected:
+        raise RuntimeError(
+            "FLOW-LoRA isolation failed; non-LoRA params trainable: "
+            f"{unexpected[:50]}"
+        )
+
+    trainable_params = sum(p.numel() for _, p in trainable)
+    if trainable_params != summary.trainable_params:
+        raise RuntimeError(
+            "Flow-LoRA trainable parameter mismatch: "
+            f"runtime={trainable_params}, "
+            f"injection={summary.trainable_params}"
+        )
+
+    print(
+        "[freeze-policy] FLOW-LORA LEVEL-3 training enabled: "
+        f"blocks={summary.num_blocks}, "
+        f"target_modules={len(summary.target_modules)}, "
+        f"trainable_tensors={summary.trainable_tensors}, "
+        f"trainable_params={summary.trainable_params:,}, "
+        f"rank={summary.rank}, alpha={summary.alpha}, "
+        f"dropout={summary.dropout}; "
+        f"targets=(attention={summary.target_attention}, "
+        f"ffn={summary.target_ffn}, "
+        f"enc_vlm={summary.target_enc_vlm}, "
+        f"output={summary.target_output}, "
+        f"action_encoder={summary.target_action_encoder}, "
+        f"action_decoder={summary.target_action_decoder}); "
+        f"group_counts=(attention={summary.attention_targets}, "
+        f"ffn={summary.ffn_targets}, "
+        f"enc_vlm={summary.enc_vlm_targets}, "
+        f"output={summary.output_targets}, "
+        f"action_encoder={summary.action_encoder_targets}, "
+        f"action_decoder={summary.action_decoder_targets}); "
+        "EVERY Base WAM/Flow parameter frozen."
+    )
+
+
+def apply_policy_freeze(
+    policy_backend,
+    freeze_policy: LatentWorldPolicyFreezeConfig,
+) -> None:
+    freeze_qwen3vl(
+        policy_backend.vlm,
+        freeze_vision_backbone=freeze_policy.freeze_vision_backbone,
+        freeze_llm_backbone=freeze_policy.freeze_llm_backbone,
+        freeze_last_llm_layer=freeze_policy.freeze_last_llm_layer,
+        freeze_embedding=freeze_policy.freeze_embedding,
+        unfreeze_vision_merger=freeze_policy.unfreeze_vision_merger,
+    )
+
+    llm_module = None
+    if (
+        freeze_policy.keep_llm_first_n_layers is not None
+        or (
+            freeze_policy.freeze_llm_backbone
+            and freeze_policy.unfreeze_llm_last_n_layers is not None
+            and freeze_policy.unfreeze_llm_last_n_layers > 0
+        )
+    ):
+        llm_module = _resolve_llm_module(policy_backend.vlm)
+
+    if freeze_policy.keep_llm_first_n_layers is not None:
+        _keep_first_n_llm_layers(
+            llm_module,
+            freeze_policy.keep_llm_first_n_layers,
+        )
+
+    if (
+        freeze_policy.freeze_llm_backbone
+        and freeze_policy.unfreeze_llm_last_n_layers is not None
+        and freeze_policy.unfreeze_llm_last_n_layers > 0
+    ):
+        _unfreeze_last_n_llm_layers(
+            llm_module,
+            freeze_policy.unfreeze_llm_last_n_layers,
+        )
+
+    _apply_strict_vlm_interface_freeze(
+        policy_backend,
+        freeze_policy,
+    )
+
+    # Preserve existing LaWAM behavior.
+    for p in policy_backend.lam.parameters():
+        p.requires_grad = False
+
+    if freeze_policy.unfreeze_lam_decoder:
+        lam_decoder = getattr(
+            policy_backend.lam,
+            "decoder",
+            None,
+        )
+        if lam_decoder is not None:
+            for p in lam_decoder.parameters():
+                p.requires_grad = True
+
+    if (
+        freeze_policy.train_flow_only
+        and freeze_policy.train_flow_lora
+    ):
+        raise RuntimeError(
+            "train_flow_only and train_flow_lora cannot both be True."
+        )
+
+    # Final-authority modes must execute last.
+    if freeze_policy.train_flow_lora:
+        _apply_flow_lora_training(
+            policy_backend,
+            freeze_policy,
+        )
+    elif freeze_policy.train_flow_only:
+        _apply_flow_only_training(policy_backend)
