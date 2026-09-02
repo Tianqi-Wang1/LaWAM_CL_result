@@ -84,6 +84,11 @@ class LatentWorldPolicyFreezeConfig:
     # Memory mode freezes the entire skill and trains only the two AEs.
     train_routing_v2_skill: bool = False
     train_routing_v2_memory_only: bool = False
+    # Simplified Routing-V2 skill path used by the B2-only experiment:
+    # task-specific VLM Text-LoRA + Action-B2 only.  Query/QFormer/LaWM stay
+    # shared and frozen.  The flag is consumed by memory-only training so the
+    # loader recreates exactly the structures present in the skill checkpoint.
+    routing_v2_b2_only_skill_path: bool = False
     routing_v2_qformer_lora_rank: int = 32
     routing_v2_qformer_lora_alpha: float = 32.0
     routing_v2_qformer_lora_dropout: float = 0.0
@@ -246,6 +251,9 @@ def parse_policy_freeze_config(
         ),
         train_routing_v2_memory_only=bool(
             freeze_cfg.get("train_routing_v2_memory_only", False)
+        ),
+        routing_v2_b2_only_skill_path=bool(
+            freeze_cfg.get("routing_v2_b2_only_skill_path", False)
         ),
         routing_v2_qformer_lora_rank=int(
             freeze_cfg.get("routing_v2_qformer_lora_rank", 32)
@@ -1487,14 +1495,37 @@ def _apply_routing_v2_memory_training(
     policy_backend,
     freeze_policy: LatentWorldPolicyFreezeConfig,
 ) -> None:
-    # Recreate all skill-path structural LoRA modules before checkpoint load, but
-    # keep them frozen. Flow side adapters are created by flow_cfg at model init.
+    # Recreate the skill-path structural LoRA modules before checkpoint load,
+    # but keep them frozen. Flow side adapters are created by flow_cfg at model
+    # init. The simplified path contains only VLM Text-LoRA; the legacy/full V2
+    # path additionally contains Query residuals plus QFormer/LaWM LoRA.
     if not bool(freeze_policy.vlm_lora_target_text):
         raise RuntimeError("Routing-V2 memory phase requires VLM text LoRA structure")
     _inject_text_only_vlm_lora(policy_backend, freeze_policy)
-    q_summary, w_summary = _inject_routing_v2_qformer_lawm_lora(
-        policy_backend, freeze_policy
-    )
+    b2_only = bool(freeze_policy.routing_v2_b2_only_skill_path)
+    if b2_only:
+        if _routing_v2_query_delta_parameters(policy_backend):
+            raise RuntimeError(
+                "B2-only Routing-V2 memory requires "
+                "framework.action_model.routing_v2_enable_query_delta=false"
+            )
+        input_mode = str(
+            getattr(policy_backend.model_cfg, "routing_v2_dynamics_input_mode", "")
+        ).lower().strip()
+        wm_source = str(
+            getattr(policy_backend.model_cfg, "routing_v2_dynamics_wm_source", "")
+        ).lower().strip()
+        if input_mode != "hdh" or wm_source != "base":
+            raise RuntimeError(
+                "B2-only Routing-V2 memory is fixed to shared Base-WM + [h, Delta h]; "
+                f"got wm_source={wm_source!r}, input_mode={input_mode!r}."
+            )
+        q_summary = None
+        w_summary = None
+    else:
+        q_summary, w_summary = _inject_routing_v2_qformer_lawm_lora(
+            policy_backend, freeze_policy
+        )
     policy_backend.requires_grad_(False)
     memory = getattr(policy_backend, "routing_v2_memory", None)
     if memory is None:
@@ -1526,9 +1557,11 @@ def _apply_routing_v2_memory_training(
     print(
         "[RoutingV2][MEMORY][PARAMS] "
         f"mode={'dynamics_only' if dynamics_only else 'semantic+dynamics'}; "
+        f"skill_path={'b2_only' if b2_only else 'full_v2'}; "
         f"trainable={mem_params:,}; summary={memory.parameter_summary()}; "
-        f"skill_struct_qformer_lora={q_summary.trainable_params:,}; "
-        f"skill_struct_lawm_lora={w_summary.trainable_params:,}; all skill params FROZEN"
+        f"skill_struct_qformer_lora={0 if q_summary is None else q_summary.trainable_params:,}; "
+        f"skill_struct_lawm_lora={0 if w_summary is None else w_summary.trainable_params:,}; "
+        "all skill params FROZEN"
     )
 
 

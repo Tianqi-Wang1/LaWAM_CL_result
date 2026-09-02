@@ -180,6 +180,9 @@ trainer:
     # Routing-V2 standalone modes.
     train_routing_v2_skill: false
     train_routing_v2_memory_only: false
+    # Compatibility switch for the simplified task path used by the new V2
+    # experiment: VLM Text-LoRA + Action-B2 only (no Query/QFormer/WM deltas).
+    routing_v2_b2_only_skill_path: false
     routing_v2_qformer_lora_rank: 32
     routing_v2_qformer_lora_alpha: 32
     routing_v2_qformer_lora_dropout: 0.0
