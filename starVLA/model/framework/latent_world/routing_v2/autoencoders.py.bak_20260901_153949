@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-DYNAMICS_INPUT_MODES = ("hdhz", "hdh", "dh")
-
-
 class SemanticTokenAutoencoder(nn.Module):
     """Task memory over Base-VLM latent-action-query hidden tokens.
 
-    Input shape: [B, Q, D_vlm]. The same bottleneck is applied token-wise, so
+    Input shape: [B, Q, D_vlm].  The same bottleneck is applied token-wise, so
     the original query structure is preserved instead of mean-pooling it away.
     Reconstruction is performed in layer-normalized feature space to make the
     error less sensitive to feature scale.
@@ -47,16 +45,12 @@ class SemanticTokenAutoencoder(nn.Module):
 
 
 class SpatialDynamicsAutoencoder(nn.Module):
-    """Task memory for future world dynamics.
+    """Task memory for latent world-action transitions.
 
-    Three input modes are supported for the 2x3 ablation:
-
-    - ``hdhz``: [h_t, Delta h, z]  (current Routing-V2 baseline)
-    - ``hdh`` : [h_t, Delta h]     (world-only with current-state context)
-    - ``dh``  : [Delta h]          (transition-only)
-
-    In all modes Delta h is reconstructed. z is reconstructed *only* in hdhz
-    mode. h_t is conditioning context and is never reconstructed.
+    The current state h_t is used as conditioning context, while the module
+    reconstructs the normalized spatial transition Delta h and latent action z.
+    This avoids letting the shared current-state reconstruction dominate the
+    task-discriminative future dynamics signal.
     """
 
     def __init__(
@@ -70,7 +64,6 @@ class SpatialDynamicsAutoencoder(nn.Module):
         num_heads: int = 6,
         ffn_dim: int = 768,
         z_loss_weight: float = 0.5,
-        input_mode: str = "hdhz",
     ) -> None:
         super().__init__()
         self.vision_dim = int(vision_dim)
@@ -78,23 +71,12 @@ class SpatialDynamicsAutoencoder(nn.Module):
         self.num_tokens = int(num_tokens)
         self.hidden_dim = int(hidden_dim)
         self.z_loss_weight = float(z_loss_weight)
-        self.input_mode = str(input_mode).lower().strip()
-        if self.input_mode not in DYNAMICS_INPUT_MODES:
-            raise ValueError(
-                f"Unknown Dynamics-AE input_mode={input_mode!r}; "
-                f"expected one of {DYNAMICS_INPUT_MODES}."
-            )
         if self.hidden_dim % int(num_heads) != 0:
             raise ValueError(
                 f"Dynamics AE hidden_dim={self.hidden_dim} must be divisible by num_heads={num_heads}."
             )
 
-        input_dim = self.vision_dim  # Delta h is always present.
-        if self.input_mode in {"hdhz", "hdh"}:
-            input_dim += self.vision_dim  # h_t context.
-        if self.input_mode == "hdhz":
-            input_dim += self.latent_dim  # latent action z.
-
+        input_dim = 2 * self.vision_dim + self.latent_dim
         self.input_proj = nn.Linear(input_dim, self.hidden_dim)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, self.hidden_dim))
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
@@ -109,14 +91,10 @@ class SpatialDynamicsAutoencoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=int(num_layers))
         self.delta_decoder = nn.Linear(self.hidden_dim, self.vision_dim)
-        self.z_decoder: Optional[nn.Module]
-        if self.input_mode == "hdhz":
-            self.z_decoder = nn.Sequential(
-                nn.LayerNorm(self.hidden_dim),
-                nn.Linear(self.hidden_dim, self.latent_dim),
-            )
-        else:
-            self.z_decoder = None
+        self.z_decoder = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.latent_dim),
+        )
 
     def _norm_vision(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(x.float(), (self.vision_dim,))
@@ -135,7 +113,7 @@ class SpatialDynamicsAutoencoder(nn.Module):
         *,
         h_t: torch.Tensor,
         h_future: torch.Tensor,
-        z: Optional[torch.Tensor] = None,
+        z: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         if h_t.dim() != 3 or h_future.dim() != 3:
             raise ValueError(
@@ -152,44 +130,27 @@ class SpatialDynamicsAutoencoder(nn.Module):
                 f"expected ({self.num_tokens},{self.vision_dim})"
             )
 
+        h_cur_n = self._norm_vision(h_t)
         delta_n = self._norm_vision(h_future - h_t)
-        pieces = []
-        if self.input_mode in {"hdhz", "hdh"}:
-            pieces.append(self._norm_vision(h_t))
-        pieces.append(delta_n)
-
-        z_n: Optional[torch.Tensor] = None
-        if self.input_mode == "hdhz":
-            if z is None:
-                raise ValueError("Dynamics AE input_mode='hdhz' requires z.")
-            z_n = self._norm_z(z)
-            pieces.append(z_n.unsqueeze(1).expand(-1, self.num_tokens, -1))
-
-        x = torch.cat(pieces, dim=-1)
+        z_n = self._norm_z(z)
+        z_tokens = z_n.unsqueeze(1).expand(-1, self.num_tokens, -1)
+        x = torch.cat([h_cur_n, delta_n, z_tokens], dim=-1)
         hidden = self.input_proj(x) + self.pos_embed.to(dtype=x.dtype, device=x.device)
         hidden = self.encoder(hidden)
 
         delta_recon = self.delta_decoder(hidden)
+        z_recon = self.z_decoder(hidden.mean(dim=1))
         delta_loss = F.mse_loss(delta_recon, delta_n)
-        per_sample_delta = (delta_recon - delta_n).pow(2).mean(dim=(1, 2))
-
-        zero = torch.zeros((), device=delta_loss.device, dtype=delta_loss.dtype)
-        per_sample_error = per_sample_delta
-        z_loss = zero
-        z_recon = None
-        if self.z_decoder is not None:
-            assert z_n is not None
-            z_recon = self.z_decoder(hidden.mean(dim=1))
-            z_loss = F.mse_loss(z_recon, z_n)
-            per_sample_z = (z_recon - z_n).pow(2).mean(dim=1)
-            per_sample_error = per_sample_error + self.z_loss_weight * per_sample_z
-
+        z_loss = F.mse_loss(z_recon, z_n)
         loss = delta_loss + self.z_loss_weight * z_loss
+
+        per_sample_delta = (delta_recon - delta_n).pow(2).mean(dim=(1, 2))
+        per_sample_z = (z_recon - z_n).pow(2).mean(dim=1)
         return {
             "loss": loss,
             "loss_delta": delta_loss,
             "loss_z": z_loss,
-            "per_sample_error": per_sample_error,
+            "per_sample_error": per_sample_delta + self.z_loss_weight * per_sample_z,
             "delta_reconstruction": delta_recon,
             "z_reconstruction": z_recon,
         }
@@ -209,7 +170,6 @@ class RoutingV2Memory(nn.Module):
         dynamics_heads: int,
         dynamics_ffn: int,
         dynamics_z_weight: float,
-        dynamics_input_mode: str = "hdhz",
     ) -> None:
         super().__init__()
         self.semantic = SemanticTokenAutoencoder(
@@ -225,15 +185,9 @@ class RoutingV2Memory(nn.Module):
             num_heads=int(dynamics_heads),
             ffn_dim=int(dynamics_ffn),
             z_loss_weight=float(dynamics_z_weight),
-            input_mode=str(dynamics_input_mode),
         )
 
-    def parameter_summary(self) -> dict[str, int | str]:
+    def parameter_summary(self) -> dict[str, int]:
         sem = sum(p.numel() for p in self.semantic.parameters())
         dyn = sum(p.numel() for p in self.dynamics.parameters())
-        return {
-            "semantic_ae": sem,
-            "dynamics_ae": dyn,
-            "total": sem + dyn,
-            "dynamics_input_mode": self.dynamics.input_mode,
-        }
+        return {"semantic_ae": sem, "dynamics_ae": dyn, "total": sem + dyn}

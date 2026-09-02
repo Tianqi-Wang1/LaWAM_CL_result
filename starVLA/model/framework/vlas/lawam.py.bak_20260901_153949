@@ -97,16 +97,6 @@ class LatentWorldPolicyConfig:
     routing_v2_dynamics_heads: int = 6
     routing_v2_dynamics_ffn: int = 768
     routing_v2_dynamics_z_weight: float = 0.5
-    # 2x3 future-dynamics ablation. ``hdhz`` is the original V2 verifier;
-    # ``hdh`` removes direct z access; ``dh`` keeps only the imagined change.
-    routing_v2_dynamics_input_mode: str = "hdhz"  # hdhz | hdh | dh
-    # ``task`` uses the task-specific LaWM LoRA for routing imagination.
-    # ``base`` temporarily disables LaWM LoRA so every skill is compared in a
-    # shared Base-WM dynamics coordinate system. Execution is unaffected.
-    routing_v2_dynamics_wm_source: str = "task"  # task | base
-    # Ablation memories reuse the already-trained Semantic AE and only optimize
-    # the Dynamics AE. This prevents six copies of the semantic memory.
-    routing_v2_memory_dynamics_only: bool = False
     routing_v2_dynamics_pred_weight: float = 0.5
     routing_v2_semantic_loss_weight: float = 1.0
     routing_v2_dynamics_loss_weight: float = 1.0
@@ -397,7 +387,6 @@ class LatentWorldPolicyBackend(nn.Module):
                 dynamics_heads=int(self.model_cfg.routing_v2_dynamics_heads),
                 dynamics_ffn=int(self.model_cfg.routing_v2_dynamics_ffn),
                 dynamics_z_weight=float(self.model_cfg.routing_v2_dynamics_z_weight),
-                dynamics_input_mode=str(self.model_cfg.routing_v2_dynamics_input_mode),
             )
             print(
                 "[RoutingV2][MEMORY] instantiated: "
@@ -724,30 +713,14 @@ class LatentWorldPolicyBackend(nn.Module):
         *,
         prepared_batch: LatentWorldPolicyTrainBatch,
     ) -> Dict[str, torch.Tensor]:
-        """Second-phase training for Routing-V2 memories.
-
-        The original V2 trains Semantic + Dynamics memories jointly. The 2x3
-        ablation sets ``routing_v2_memory_dynamics_only=true`` so the existing
-        Semantic bank stays fixed and only a new Dynamics memory is learned.
-        """
+        """Second-phase training for Semantic AE + Dynamics AE only."""
         if self.routing_v2_memory is None:
             raise RuntimeError("Routing-V2 memory forward requested without routing_v2_memory module.")
         device = prepared_batch["input_ids"].device
-        dynamics_only = bool(self.model_cfg.routing_v2_memory_dynamics_only)
-        input_mode = str(self.model_cfg.routing_v2_dynamics_input_mode).lower().strip()
-        wm_source = str(self.model_cfg.routing_v2_dynamics_wm_source).lower().strip()
-        if input_mode not in {"hdhz", "hdh", "dh"}:
-            raise ValueError(f"Unknown routing_v2_dynamics_input_mode={input_mode!r}")
-        if wm_source not in {"task", "base"}:
-            raise ValueError(f"Unknown routing_v2_dynamics_wm_source={wm_source!r}")
 
         # Policy / teacher features are immutable targets in this phase.
         with torch.no_grad():
-            anchor_hact = None
-            if not dynamics_only:
-                anchor_hact = self._run_routing_v2_base_anchor_hact(
-                    prepared_batch=prepared_batch
-                ).detach()
+            anchor_hact = self._run_routing_v2_base_anchor_hact(prepared_batch=prepared_batch).detach()
             skill = self._run_shared_encoding_train(
                 prepared_batch=prepared_batch,
                 source="LatentWorldPolicyBackend.routing_v2_memory",
@@ -760,40 +733,17 @@ class LatentWorldPolicyBackend(nn.Module):
             h_t = skill.h_t.detach()
             h_gt = skill.h_t1_gt.detach()
             z_pred = skill.pred_action_emb.detach()
+            h_pred = skill.h_t1_pred.detach()
 
-            if wm_source == "task":
-                h_pred = skill.h_t1_pred.detach()
-            else:
-                # Keep the task-specific VLM/query/QFormer latent z_k, but use
-                # the same frozen Base LaWM decoder for every skill comparison.
-                # Only LoRA residual scaling inside the decoder is disabled.
-                with temporarily_disable_lora(self.lam.decoder):
-                    h_pred = self._decode_future_tokens_strict_single_query(
-                        h_t=h_t,
-                        pred_action_emb=z_pred,
-                        source="LatentWorldPolicyBackend.routing_v2_memory.base_wm",
-                    ).detach()
-
-        zero = torch.zeros((), device=device, dtype=torch.float32)
-        if dynamics_only:
-            sem_loss = zero
-        else:
-            assert anchor_hact is not None
-            sem = self.routing_v2_memory.semantic(anchor_hact)
-            sem_loss = sem["loss"]
-
-        dyn_gt = self.routing_v2_memory.dynamics(
-            h_t=h_t, h_future=h_gt, z=teacher_z if input_mode == "hdhz" else None
-        )
-        dyn_pred = self.routing_v2_memory.dynamics(
-            h_t=h_t, h_future=h_pred, z=z_pred if input_mode == "hdhz" else None
-        )
+        sem = self.routing_v2_memory.semantic(anchor_hact)
+        dyn_gt = self.routing_v2_memory.dynamics(h_t=h_t, h_future=h_gt, z=teacher_z)
+        dyn_pred = self.routing_v2_memory.dynamics(h_t=h_t, h_future=h_pred, z=z_pred)
 
         pred_w = float(self.model_cfg.routing_v2_dynamics_pred_weight)
         pred_w = max(0.0, min(1.0, pred_w))
         loss_dyn = (1.0 - pred_w) * dyn_gt["loss"] + pred_w * dyn_pred["loss"]
         loss_total = (
-            float(self.model_cfg.routing_v2_semantic_loss_weight) * sem_loss
+            float(self.model_cfg.routing_v2_semantic_loss_weight) * sem["loss"]
             + float(self.model_cfg.routing_v2_dynamics_loss_weight) * loss_dyn
         )
         zero = torch.zeros((), device=device, dtype=loss_total.dtype)
@@ -803,7 +753,7 @@ class LatentWorldPolicyBackend(nn.Module):
             "loss_distill": zero,
             "loss_vlm": zero,
             "loss_total": loss_total,
-            "loss_routing_v2_semantic": sem_loss,
+            "loss_routing_v2_semantic": sem["loss"],
             "loss_routing_v2_dynamics": loss_dyn,
             "loss_routing_v2_dynamics_gt": dyn_gt["loss"],
             "loss_routing_v2_dynamics_pred": dyn_pred["loss"],

@@ -1501,31 +1501,17 @@ def _apply_routing_v2_memory_training(
         raise RuntimeError(
             "Routing-V2 memory phase requires framework.action_model.routing_v2_enable_memory=true"
         )
-
-    dynamics_only = bool(
-        getattr(policy_backend.model_cfg, "routing_v2_memory_dynamics_only", False)
-    )
-    if dynamics_only:
-        # 2x3 ablation: reuse the existing Semantic bank and train only the new
-        # future-dynamics verifier. This also avoids storing six Semantic AEs.
-        memory.requires_grad_(False)
-        memory.dynamics.requires_grad_(True)
-        allowed_prefix = "routing_v2_memory.dynamics."
-    else:
-        memory.requires_grad_(True)
-        allowed_prefix = "routing_v2_memory."
-
+    memory.requires_grad_(True)
     trainable = [(n, p) for n, p in policy_backend.named_parameters() if p.requires_grad]
-    unexpected = [n for n, _ in trainable if not n.startswith(allowed_prefix)]
+    unexpected = [n for n, _ in trainable if not n.startswith("routing_v2_memory.")]
     if unexpected:
         raise RuntimeError(
-            "Routing-V2 memory isolation failed; unexpected trainable tensors: "
+            "Routing-V2 memory isolation failed; only routing_v2_memory may train: "
             f"{unexpected[:50]}"
         )
     mem_params = sum(p.numel() for _, p in trainable)
     print(
         "[RoutingV2][MEMORY][PARAMS] "
-        f"mode={'dynamics_only' if dynamics_only else 'semantic+dynamics'}; "
         f"trainable={mem_params:,}; summary={memory.parameter_summary()}; "
         f"skill_struct_qformer_lora={q_summary.trainable_params:,}; "
         f"skill_struct_lawm_lora={w_summary.trainable_params:,}; all skill params FROZEN"
