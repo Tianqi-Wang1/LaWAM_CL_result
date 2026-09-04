@@ -70,6 +70,7 @@ fi
 
 if [ "${RUN_TASKID_EVAL}" = "true" ]; then
   NUM_TRIALS="${NUM_TRIALS}" \
+  EVAL_NAMESPACE="routing_v2_b2only_taskid" \
     bash "${ROOT}/scripts/eval_libero_goal_routing_v2_taskid_all.sh"
 fi
 
@@ -90,6 +91,6 @@ done
 echo "======================================================================"
 echo " Routing-V2 B2-only training complete"
 echo " Base/skill policy storage : final_model/pytorch_model.pt only"
-echo " AE storage                : step_1000, step_2000, step_5000"
+echo " AE storage                : ${MEMORY_SNAPSHOT_STEPS}"
 echo " Root                      : ${V2_ROOT}"
 echo "======================================================================"

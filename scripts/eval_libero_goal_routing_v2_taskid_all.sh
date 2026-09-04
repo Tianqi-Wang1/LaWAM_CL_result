@@ -22,12 +22,14 @@ EVAL_GPU="${EVAL_GPU:-5}"
 SAVE_VIDEOS="${SAVE_VIDEOS:-False}"
 
 STAMP="${EVAL_STAMP:-$(date +"%Y%m%d_%H%M%S")}" 
-OUT_ROOT="${ROOT}/results/eval_runs/lawam_cl/libero_goal/routing_v2_taskid/${STAMP}"
+EVAL_NAMESPACE="${EVAL_NAMESPACE:-routing_v2_taskid}"
+OUT_ROOT="${ROOT}/results/eval_runs/lawam_cl/libero_goal/${EVAL_NAMESPACE}/${STAMP}"
 mkdir -p "${OUT_ROOT}"
 MASTER_LOG="${OUT_ROOT}/taskid_eval.log"
 exec > >(tee -a "${MASTER_LOG}") 2>&1
 
-echo "${OUT_ROOT}" > "${ROOT}/results/eval_runs/lawam_cl/libero_goal/routing_v2_taskid/latest_eval_run.txt"
+mkdir -p "${ROOT}/results/eval_runs/lawam_cl/libero_goal/${EVAL_NAMESPACE}"
+echo "${OUT_ROOT}" > "${ROOT}/results/eval_runs/lawam_cl/libero_goal/${EVAL_NAMESPACE}/latest_eval_run.txt"
 
 export LIBERO_HOME=/home/jincai_guo/tianqi/CVPR2027/LIBERO
 export LIBERO_PYTHON=/home/jincai_guo/tianqi/CVPR2027/bin/libero_osmesa_python

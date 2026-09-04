@@ -94,20 +94,23 @@ This retains a common semantic coordinate system across all tasks.
 ### Dynamics AE input
 
 ```text
-observation + instruction
-  -> task VLM Text-LoRA
-  -> shared frozen queries
-  -> shared frozen QFormer
-  -> z_k
-  -> shared frozen Base-WM
-  -> h_hat_k
-  -> [h_t, h_hat_k - h_t]
-  -> task Dynamics AE
+observation + instruction                    observation frames
+  -> task VLM Text-LoRA                        -> frozen DINO/LAM encoder
+  -> shared frozen queries                     -> shared h_t
+  -> shared frozen QFormer                           |
+  -> task-conditioned z_k                            |
+             |                                       |
+             +--------> shared frozen Base-WM <------+
+                              -> h_hat_k
+                              -> [h_t, h_hat_k - h_t]
+                              -> task Dynamics AE
 ```
 
 The verifier uses `input_mode=hdh`: direct `z` is not reconstructed or scored. The Dynamics loss
 keeps the existing 50/50 mixture of real/teacher transitions and correct-skill predicted
-transitions. Both AEs are task-local memories; no task-pair relationship is used.
+transitions. `h_t` itself is a shared DINO/LAM visual feature; task Text-LoRA affects the verifier
+through `z_k`, and therefore through `h_hat_k` and `Delta h_k`. Both AEs are task-local memories;
+no task-pair relationship is used.
 
 During this phase, every policy/skill parameter is frozen. After the three compact snapshots are
 extracted, all temporary full-policy memory checkpoints are deleted.
@@ -145,15 +148,15 @@ scripts/extract_routing_v2_memory_snapshots.py
 scripts/run_libero_goal_routing_v2_b2only_skill_task.sh
 scripts/run_libero_goal_routing_v2_b2only_memory_task.sh
 scripts/run_libero_goal_routing_v2_b2only_all.sh
+scripts/eval_libero_goal_routing_v2_taskid_all.sh
 docs/ROUTING_V2_B2ONLY_TRAINING.md
 ```
 
-The existing scripts below are reused and do not need replacement if the server checkout already
-matches this repository:
+The existing Base script below is reused and does not need replacement if the server checkout
+already matches this repository:
 
 ```text
 scripts/run_libero_goal_routing_v2_base.sh
-scripts/eval_libero_goal_routing_v2_taskid_all.sh
 ```
 
 ## 5. Recommended commands
@@ -234,6 +237,7 @@ optimizer steps:
 ```bash
 V2_ROOT=/home/jincai_guo/tianqi/CVPR2027/checkpoints/lawam_cl/libero_goal/routing_v2_b2only_smoke \
 BASE_STEPS=20 \
+BASE_WARMUP_STEPS=2 \
 SKILL_STEPS=20 \
 SKILL_WARMUP_STEPS=2 \
 MEMORY_STEPS=20 \
